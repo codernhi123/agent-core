@@ -22,6 +22,7 @@ import csv
 import json
 import os
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 
 import yaml
@@ -72,7 +73,7 @@ async def main(args: argparse.Namespace) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     out_csv = Path(args.out).expanduser().resolve()
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    work_dir = Path(args.work_dir).expanduser().resolve() if args.work_dir else out_csv.with_suffix("")
+    work_dir = Path(args.work_dir).expanduser().resolve() if args.work_dir else out_csv.parent
     harbor_runtime.configure_harbor_trials(trials_root=work_dir / "harbor_trials", model_name=args.model_name)
     backend = SingleHarnessExecutionBackend(
         config=EvaluatorConfig(model_config_ref=str(Path(args.model_config).expanduser().resolve()))
@@ -98,11 +99,12 @@ async def main(args: argparse.Namespace) -> int:
 
     async def run_episode(label: str, harness_path: str, case: dict, trial: int) -> None:
         case_id = case["case_id"]
+        episode_dir = work_dir / "episodes" / f"{label}__{case_id}__t{trial}"
         async with slots:
             try:
                 result = await backend.execute(
                     case=dict(case),
-                    output_dir=str(work_dir / "episodes" / f"{label}__{case_id}__t{trial}"),
+                    output_dir=str(episode_dir),
                     session_id=f"heldout-{label}-{case_id}-t{trial}-{uuid.uuid4().hex[:8]}",
                     harness_refs={"solver": harness_path},
                 )
@@ -111,6 +113,23 @@ async def main(args: argparse.Namespace) -> int:
                 print(f"[heldout] FAILED {failures[-1]}", flush=True)
                 return
         info = result.metadata["terminal_bench"]
+        # Same content the search path keeps per case: score, verifier details, command_log.
+        (episode_dir / "episode.json").write_text(
+            json.dumps(
+                {
+                    "harness": label,
+                    "task": case_id,
+                    "trial": trial,
+                    "execution_status": result.execution_status,
+                    "evaluation": asdict(result.judge_result),
+                    "execution": result.metadata,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
         row = [
             ARM,
             label,
@@ -135,7 +154,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cases", required=True, help="held-out cases JSON from convert_tb2.py")
     parser.add_argument("--port", type=int, required=True, help="llama-server port")
     parser.add_argument("--out", required=True, help="CSV to append rows to")
-    parser.add_argument("--work-dir", default="", help="episode outputs (default: next to the CSV)")
+    parser.add_argument("--work-dir", default="", help="episodes/ and harbor_trials/ (default: the CSV's folder)")
     parser.add_argument("--model-config", default=str(TB2_DIR / "models" / "qwen.yaml"))
     parser.add_argument("--trials", type=int, default=2)
     parser.add_argument("--concurrency", type=int, default=4)

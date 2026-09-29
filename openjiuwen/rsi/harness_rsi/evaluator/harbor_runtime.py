@@ -44,6 +44,10 @@ JUDGE_METHOD = "terminal_bench_harbor"
 REWARD_KEY = "reward"
 # Abort the run instead of scoring a dead Docker daemon as a string of zeros.
 MAX_CONSECUTIVE_SETUP_FAILURES = 3
+# Wall-clock cap per episode, including setup and verification: the reef arm's
+# executor timeout. A capped episode has no verifier reward and scores 0.
+EPISODE_TIMEOUT_SECONDS = 9000
+EPISODE_TIMEOUT_EXCEPTION = "EpisodeTimeoutError"
 
 RunAgent = Callable[[str, Any], Awaitable[None]]
 
@@ -275,7 +279,13 @@ async def run_harbor_trial(*, task_dir: str | Path, run_agent: RunAgent, trials_
             }
         )
         trial = await Trial.create(config)
-        result = await trial.run()
+        try:
+            result = await asyncio.wait_for(trial.run(), timeout=EPISODE_TIMEOUT_SECONDS)
+        except TimeoutError:
+            # Harbor stops the environment and writes result.json on cancellation.
+            result = trial.result
+            if result.exception_info is not None:
+                result.exception_info.exception_type = EPISODE_TIMEOUT_EXCEPTION
     finally:
         _LIVE_AGENTS.pop(token, None)
         if budget is not None:

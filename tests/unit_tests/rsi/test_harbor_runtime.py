@@ -172,3 +172,80 @@ def test_judger_accepts_terminal_bench_case_with_task_dir(tmp_path: Path) -> Non
     judger.validate_case({"case_id": "c", "input": "x", "terminal_bench": {"task_dir": str(tmp_path)}})
     with pytest.raises(EvaluationInfrastructureError):
         judger.validate_case({"case_id": "c", "input": "x", "terminal_bench": {"task_dir": str(tmp_path / "no")}})
+
+
+def _fake_harbor(monkeypatch: pytest.MonkeyPatch, run_seconds: float) -> None:
+    """Install minimal harbor modules so run_harbor_trial runs without Docker."""
+    import sys
+    import types
+
+    class _Config:
+        @classmethod
+        def model_validate(cls, data):
+            config = cls()
+            config.__dict__.update(data)
+            return config
+
+        def model_dump(self):
+            return vars(self)
+
+    class _Trial:
+        def __init__(self, trials_dir: Path) -> None:
+            self.paths = SimpleNamespace(trial_dir=trials_dir / "t1")
+            self.result = _trial(started=True, exception_type="CancelledError")
+
+        @classmethod
+        async def create(cls, config):
+            return cls(Path(config.trials_dir))
+
+        async def run(self):
+            await asyncio.sleep(run_seconds)
+            return _trial(rewards={"reward": 1.0})
+
+    config_module = types.ModuleType("harbor.models.trial.config")
+    config_module.TaskConfig = config_module.TrialConfig = _Config
+    trial_module = types.ModuleType("harbor.trial.trial")
+    trial_module.Trial = _Trial
+    monkeypatch.setitem(sys.modules, "harbor.models.trial.config", config_module)
+    monkeypatch.setitem(sys.modules, "harbor.trial.trial", trial_module)
+
+
+@pytest.mark.asyncio
+async def test_episode_over_the_cap_scores_zero_and_frees_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openjiuwen.rsi.harness_rsi.evaluator import harbor_runtime
+
+    _fake_harbor(monkeypatch, run_seconds=5)
+    monkeypatch.setattr(harbor_runtime, "EPISODE_TIMEOUT_SECONDS", 0.05)
+    budget = EpisodeBudget(10)
+    monkeypatch.setattr(harbor_runtime, "SETTINGS", harbor_runtime.HarborTrialSettings(budget=budget))
+
+    async def run_agent(instruction, environment):
+        return None
+
+    result, trial_dir = await harbor_runtime.run_harbor_trial(
+        task_dir=tmp_path, run_agent=run_agent, trials_dir=tmp_path
+    )
+    judged = judge_from_trial(result, trial_dir, case_id="c")
+
+    assert judged.score == 0.0
+    assert judged.metadata["exception_type"] == harbor_runtime.EPISODE_TIMEOUT_EXCEPTION
+    assert (budget.started, budget.finished) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_episode_under_the_cap_keeps_its_reward(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from openjiuwen.rsi.harness_rsi.evaluator import harbor_runtime
+
+    _fake_harbor(monkeypatch, run_seconds=0)
+    monkeypatch.setattr(harbor_runtime, "SETTINGS", harbor_runtime.HarborTrialSettings())
+
+    async def run_agent(instruction, environment):
+        return None
+
+    result, trial_dir = await harbor_runtime.run_harbor_trial(
+        task_dir=tmp_path, run_agent=run_agent, trials_dir=tmp_path
+    )
+
+    assert judge_from_trial(result, trial_dir, case_id="c").passed
