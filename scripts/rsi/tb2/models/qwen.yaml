@@ -1,0 +1,15 @@
+# Local Qwen 27B served by llama.cpp. One file for every role (solver agent,
+# analyzer, optimizer), like the reef arm. run_rsi_tb2.py sets RSI_TB2_PORT:
+# 8082 = GPU 7 dev/preliminary server, 8081 = GPU 6 (official, after reef).
+model_client_config:
+  client_provider: OpenAI
+  api_base: "http://127.0.0.1:${RSI_TB2_PORT}/v1"
+  api_key: sk-local
+  # ~17 tok/s per request at 4 concurrent; long analyzer outputs need minutes.
+  timeout: 1800
+model_request_config:
+  model: qwen27b
+  temperature: 0.7   # matched with reef
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false   # matched with reef (RSI also forces reasoning off)

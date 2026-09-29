@@ -116,6 +116,14 @@ class SingleHarnessExecutionBackend:
     ) -> CaseExecutionResult:
         """Run one standalone harness and leave scoring to CaseRunner."""
         logger.info("[SingleHarnessExecutionBackend] begin to execute case: {}".format(case.get("case_id", "")))
+        if isinstance(case.get("terminal_bench"), dict):
+            return await self._execute_terminal_bench(
+                case=case,
+                output_dir=output_dir,
+                session_id=session_id,
+                team_skill_ref_path=team_skill_ref_path,
+                harness_refs=harness_refs,
+            )
         status = "passed"
         response: Any = None
         error = ""
@@ -291,6 +299,151 @@ class SingleHarnessExecutionBackend:
             ),
         )
 
+    async def _execute_terminal_bench(
+        self,
+        *,
+        case: dict[str, Any],
+        output_dir: str,
+        session_id: str,
+        team_skill_ref_path: str | Path | None,
+        harness_refs: dict[str, str] | None,
+    ) -> CaseExecutionResult:
+        """Run a Terminal-Bench task as a Harbor trial; the verifier reward is the score.
+
+        The DeepAgent is built as in the SWE-bench container path (shell-only,
+        same rails and trajectory capture), but inside the Harbor agent phase so
+        its bash tool reaches the trial's task container.
+        """
+        from openjiuwen.rsi.harness_rsi.evaluator.harbor_runtime import (
+            SETTINGS,
+            build_harbor_sys_operation,
+            container_workdir,
+            judge_from_trial,
+            log_trial,
+            run_harbor_trial,
+        )
+
+        case_id = str(case.get("case_id") or session_id)
+        role_name, harness_path = _resolve_single_harness_ref(harness_refs or {})
+        workspace_dir = Path(output_dir).expanduser().resolve() / "workspace"
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        command_recorder = TerminalBenchCommandRecorder()
+        model = load_member_optimizer_model(self.config.model_config_ref)
+        outcome: dict[str, Any] = {"response": None, "agent_error": "", "workdir": ""}
+        skill_use_rails: list[Any] = []
+        controlled_skill_treatment: ControlledSkillTreatmentRail | None = None
+
+        async def run_agent(instruction: str, environment: Any) -> None:
+            # Harbor's instruction is instruction.md; the case input is the same
+            # text plus any feedback the optimizer attached to this case.
+            nonlocal skill_use_rails, controlled_skill_treatment
+            workdir = await container_workdir(environment)
+            outcome["workdir"] = workdir
+            sys_operation = build_harbor_sys_operation(
+                sys_operation_id=f"tb2_single_{session_id}",
+                environment=environment,
+                workspace_dir=workspace_dir,
+                container_workspace_dir=workdir,
+                recorder=command_recorder,
+            )
+            agent_rails = _single_harness_rails(
+                team_skill_ref_path,
+                harness_path=harness_path,
+                shell_only=True,
+                controlled_skill_name=_controlled_skill_name(case),
+                workspace=workdir,
+            )
+            controlled_skill_treatment = next(
+                (rail for rail in agent_rails if isinstance(rail, ControlledSkillTreatmentRail)),
+                None,
+            )
+            agent = create_deep_agent(
+                model=model,
+                card=AgentCard(
+                    name=role_name,
+                    description=f"Single harness evaluator role: {role_name}",
+                ),
+                system_prompt=_single_harness_system_prompt(role_name, workspace=workdir),
+                workspace=str(workspace_dir),
+                rails=[rail for rail in agent_rails if not isinstance(rail, RSISkillUseRail)],
+                enable_task_loop=False,
+                max_iterations=100,
+                language="en",
+                restrict_to_work_dir=False,
+                auto_create_workspace=True,
+                sys_operation=sys_operation,
+            )
+            try:
+                await Runner.start()
+                for rail in agent_rails:
+                    if isinstance(rail, RSISkillUseRail):
+                        await agent.register_rail(rail)
+                await agent.load_plugin(harness_path)
+                skill_use_rails = list(agent.find_rails_by_type((RSISkillUseRail,)))
+                for skill_rail in skill_use_rails:
+                    skill_rail.list_skill_model = model
+                    skill_rail.trigger_at_task_start = True
+                _enforce_container_sys_operation_rail(agent)
+                _attach_single_harness_trajectory_rail(
+                    agent,
+                    output_dir=output_dir,
+                    role_name=role_name,
+                    trajectory_span_processor=self._trajectory_span_processor,
+                )
+                outcome["response"] = await run_agent_with_empty_response_recovery(
+                    agent,
+                    {"query": _terminal_bench_query(_case_inputs(case), workdir)},
+                    session=session_id,
+                )
+            except Exception as exc:
+                # The agent stopped; the verifier still scores the container,
+                # as it would for any Harbor agent that exits early.
+                outcome["agent_error"] = f"{type(exc).__name__}: {exc}"
+                logger.warning("[SingleHarnessExecutionBackend] agent error on case {}: {}", case_id, exc)
+            finally:
+                try:
+                    await agent.cleanup_task_resources()
+                finally:
+                    agent.ability_manager.teardown_tools()
+
+        trials_dir = Path(SETTINGS.trials_root) if SETTINGS.trials_root else Path(output_dir) / "harbor_trials"
+        result, trial_dir = await run_harbor_trial(
+            task_dir=case["terminal_bench"]["task_dir"],
+            run_agent=run_agent,
+            trials_dir=trials_dir,
+        )
+        log_trial(case_id, result)
+        judge_result = judge_from_trial(result, trial_dir, case_id=case_id)
+        agent_started = result.agent_execution is not None
+        metadata = _single_harness_metadata(
+            role_name=role_name,
+            workspace_before={},
+            workspace_after={},
+            team_skill_ref_path=team_skill_ref_path,
+            controlled_skill_treatment=(
+                controlled_skill_treatment.evidence() if controlled_skill_treatment is not None else None
+            ),
+            skill_triggers=[rail.task_trigger_evidence() for rail in skill_use_rails],
+            command_recorder=command_recorder,
+        )
+        metadata["terminal_bench"] = {
+            "trial_dir": str(trial_dir),
+            "container_workdir": outcome["workdir"],
+            "agent_started": agent_started,
+            "agent_error": outcome["agent_error"],
+            "rewards": judge_result.metadata.get("rewards", {}),
+            "exception_type": judge_result.metadata.get("exception_type", ""),
+        }
+        logger.info("[SingleHarnessExecutionBackend] end to execute case: {}".format(case_id))
+        return CaseExecutionResult(
+            response=outcome["response"],
+            execution_status="passed" if agent_started else "failed",
+            error="" if agent_started else judge_result.reason,
+            judge_result=judge_result,
+            workspace_dir=str(workspace_dir),
+            metadata=metadata,
+        )
+
     async def cleanup(self, team_name: str, session_id: str) -> None:
         """No-op; execute releases case resources, not the host-owned Runner."""
 
@@ -443,6 +596,18 @@ def _normalize_case_input_for_backend(case: dict[str, Any], value: Any) -> Any:
             f"{value}"
         )
     return value
+
+
+def _terminal_bench_query(value: Any, workdir: str) -> Any:
+    """Expose the Harbor task container without altering the stored task input."""
+    if not isinstance(value, str):
+        return value
+    return (
+        "Execution environment: you are working inside the task container. Shell commands "
+        f"already run in `{workdir}`. Use `bash` for all file inspection and edits; the host "
+        "filesystem is not the task environment.\n\n"
+        f"{value}"
+    )
 
 
 def _resolve_single_harness_ref(harness_refs: dict[str, str]) -> tuple[str, str]:

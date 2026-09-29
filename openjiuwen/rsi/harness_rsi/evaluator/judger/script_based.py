@@ -48,6 +48,11 @@ class ScriptBasedJudger(EvaluationJudger):
             if not path.is_file():
                 raise EvaluationInfrastructureError("SWE-bench official_dataset_path is missing")
             return
+        if isinstance(case.get("terminal_bench"), dict):
+            # The Harbor trial's verifier supplies the backend JudgeResult.
+            if not Path(str(case["terminal_bench"].get("task_dir") or "")).is_dir():
+                raise EvaluationInfrastructureError("Terminal-Bench task_dir is missing")
+            return
         if reference.get("files"):
             raise EvaluationInfrastructureError("reference.files has no supported verifier adapter")
         if _reference_answer(case) is None:
